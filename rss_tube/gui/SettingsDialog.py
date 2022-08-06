@@ -5,11 +5,14 @@ from PyQt6 import QtCore, QtWidgets
 
 from .designs.widget_settings import Ui_Dialog
 from .FiltersWidget import FiltersWidget
+from .PurgeEntriesDialog import PurgeEntriesDialog
+from .PurgeExcludeDialog import PurgeExcludeDialog
 from .ShortcutDialog import ShortcutsDialog
 from rss_tube.database.settings import Settings
 from rss_tube.gui.themes import styles
 from rss_tube.utils import center_widget
 from rss_tube.utils import set_icons, set_style
+from rss_tube.tasks import ExportSettingsTask, ImportSettingsTask
 
 
 logger = logging.getLogger("logger")
@@ -17,6 +20,12 @@ settings = Settings()
 
 
 class SettingsDialog(QtWidgets.QDialog, Ui_Dialog):
+    quit_requested = QtCore.pyqtSignal()
+    import_channels = QtCore.pyqtSignal()
+    export_channels = QtCore.pyqtSignal()
+    import_filters = QtCore.pyqtSignal()
+    export_filters = QtCore.pyqtSignal()
+
     def __init__(self, mainwindow: QtWidgets.QMainWindow):
         super(SettingsDialog, self).__init__()
         self.setupUi(self)
@@ -35,6 +44,8 @@ class SettingsDialog(QtWidgets.QDialog, Ui_Dialog):
         self.link_callbacks()
 
     def initUI(self):
+        self.groupBox_filters.hide()
+
         self.buttonBox.button(QtWidgets.QDialogButtonBox.StandardButton.Apply).setEnabled(False)
 
         # General Tab
@@ -62,7 +73,7 @@ class SettingsDialog(QtWidgets.QDialog, Ui_Dialog):
 
         # Player Tab
         player = settings.value("player", type=str)
-        self.combo_player.addItems(["mpv", "vlc"])
+        self.combo_player.addItems(["mpv", "vlc", "generic"])
         self.combo_player.setCurrentText(player)
         self.combo_player_changed(player)
 
@@ -73,17 +84,15 @@ class SettingsDialog(QtWidgets.QDialog, Ui_Dialog):
         # Database Tab
         self.cb_preload_thumbnails.setChecked(settings.value("cache/preload_thumbnails", type=bool))
         self.spin_entries_to_fetch.setValue(settings.value("MainWindow/entries_to_fetch", type=int))
-        self.cb_delete_added.setChecked(settings.value("delete/added_more_than", type=bool))
-        self.spin_delete_added.setValue(settings.value("delete/added_more_than_days", type=int))
-        self.cb_keep_unviewed.setChecked(settings.value("delete/keep_unviewed", type=bool))
-        self.pb_reset_feeds.hide()
-        self.pb_reset_categories.hide()
+        self.cb_purge_schedule.setChecked(settings.value("purge/enabled", type=bool))
+        self.cb_keep_unviewed.setChecked(settings.value("purge/keep_unviewed", type=bool))
+        self.spin_entries_to_keep.setValue(settings.value("purge/entries_to_keep", type=int))
 
         # Filters tab
         self.gridLayout_tab_filters = QtWidgets.QGridLayout(self.tab_filters)
         self.gridLayout_tab_filters.addWidget(FiltersWidget(self))
 
-        # Connection tab
+        # Advanced tab
         self.groupBox_proxy.setChecked(settings.value("proxies/enabled", type=bool))
         self.line_proxy_host.setText(settings.value("proxies/socks/host", type=str))
         self.spin_proxy_port.setValue(settings.value("proxies/socks/port", type=int))
@@ -102,12 +111,41 @@ class SettingsDialog(QtWidgets.QDialog, Ui_Dialog):
         self.combo_player_quality.setCurrentText(settings.value("player/mpv/quality", type=str))
         if player == "mpv":
             self.groupBox_player_quality.show()
-        elif player == "vlc":
+        else:
             self.groupBox_player_quality.hide()
 
     def combo_theme_changed(self):
         self.setting_theme_changed = True
         self.settings_changed_callback()
+    
+    def purge_entries_callback(self):
+        purge_entries_dialog = PurgeEntriesDialog(self)
+        purge_entries_dialog.exec()
+    
+    def export_settings_callback(self):
+        fname = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Settings", settings.value("Settings/export_path", type=str), "*",
+        )[0]
+        if fname and os.path.exists(os.path.dirname(fname)):
+            self.export_settings_task = ExportSettingsTask(fname)
+            self.export_settings_task.start()
+            settings.setValue("Settings/export_path", fname)
+
+    def import_settings_success_callback(self):
+        response = QtWidgets.QMessageBox.information(
+            self, "Restart to apply settings", "Restart to apply settings"
+        )
+        if response == QtWidgets.QMessageBox.StandardButton.Ok:
+            self.quit_requested.emit()
+
+    def import_settings_callback(self):
+        fname = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import Settings", settings.value("Settings/export_path", type=str), "*",
+        )[0]
+        if fname and os.path.exists(fname):
+            self.import_settings_task = ImportSettingsTask(fname)
+            self.import_settings_task.success.connect(self.import_settings_success_callback)
+            self.import_settings_task.start()
 
     def reset_settings_callback(self):
         response = QtWidgets.QMessageBox.warning(
@@ -119,11 +157,16 @@ class SettingsDialog(QtWidgets.QDialog, Ui_Dialog):
         )
         if response == QtWidgets.QMessageBox.StandardButton.Ok:
             settings.clear()
+            self.quit_requested.emit()
 
     def player_path_callback(self):
         fname = QtWidgets.QFileDialog.getOpenFileName(self, "Open", os.path.dirname(self.line_player_path.text()), "*")[0]
         if fname and os.path.exists(os.path.dirname(fname)):
             self.line_player_path.setText(fname)
+    
+    def exclude_callback(self):
+        dialog = PurgeExcludeDialog(self)
+        dialog.exec()
 
     def link_callbacks(self):
         self.buttonBox.button(QtWidgets.QDialogButtonBox.StandardButton.Apply).clicked.connect(self.apply_settings)
@@ -154,17 +197,25 @@ class SettingsDialog(QtWidgets.QDialog, Ui_Dialog):
         # Database Tab
         self.cb_preload_thumbnails.stateChanged.connect(self.settings_changed_callback)
         self.spin_entries_to_fetch.valueChanged.connect(self.settings_changed_callback)
-        self.cb_delete_added.stateChanged.connect(self.settings_changed_callback)
-        self.spin_delete_added.valueChanged.connect(self.settings_changed_callback)
+        self.pb_purge_entries.clicked.connect(self.purge_entries_callback)
+        self.cb_purge_schedule.stateChanged.connect(self.settings_changed_callback)
+        self.spin_entries_to_keep.valueChanged.connect(self.settings_changed_callback)
         self.cb_keep_unviewed.stateChanged.connect(self.settings_changed_callback)
-
-        self.pb_open_database.clicked.connect(self.mainwindow.open_database_callback)
-        self.pb_reset_feeds.clicked.connect(self.mainwindow.feeds.delete_all_feeds)
-        self.pb_reset_categories.clicked.connect(self.mainwindow.feeds.delete_all_categories)
-        self.pb_reset_settings.clicked.connect(self.reset_settings_callback)
+        self.pb_exclude_channels.clicked.connect(self.exclude_callback)
+        
         self.pb_reset_cache.clicked.connect(self.mainwindow.feeds.downloader.cache.clear)
 
-        # Connection tab
+        self.pb_open_database.clicked.connect(self.mainwindow.open_database_callback)
+
+        # Advanced tab
+        self.pb_reset_settings.clicked.connect(self.reset_settings_callback)
+        self.pb_export_settings.clicked.connect(self.export_settings_callback)
+        self.pb_import_settings.clicked.connect(self.import_settings_callback)
+        self.pb_import_channels.clicked.connect(self.import_channels.emit)
+        self.pb_export_channels.clicked.connect(self.export_channels.emit)
+        self.pb_import_filters.clicked.connect(self.import_filters.emit)
+        self.pb_export_filters.clicked.connect(self.export_filters.emit)
+
         self.groupBox_proxy.toggled.connect(self.settings_changed_callback)
         self.line_proxy_host.textChanged.connect(self.settings_changed_callback)
         self.spin_proxy_port.valueChanged.connect(self.settings_changed_callback)
@@ -217,11 +268,11 @@ class SettingsDialog(QtWidgets.QDialog, Ui_Dialog):
         # Database Tab
         settings.setValue("cache/preload_thumbnails", self.cb_preload_thumbnails.isChecked())
         settings.setValue("MainWindow/entries_to_fetch", self.spin_entries_to_fetch.value())
-        settings.setValue("delete/added_more_than", self.cb_delete_added.isChecked())
-        settings.setValue("delete/added_more_than_days", self.spin_delete_added.value())
-        settings.setValue("delete/keep_unviewed", self.cb_keep_unviewed.isChecked())
+        settings.setValue("purge/enabled", self.cb_purge_schedule.isChecked())
+        settings.setValue("purge/entries_to_keep", self.spin_entries_to_keep.value())
+        settings.setValue("purge/keep_unviewed", self.cb_keep_unviewed.isChecked())
 
-        # Connection tab
+        # Advanced tab
         settings.setValue("proxies/enabled", self.groupBox_proxy.isChecked())
         settings.setValue("proxies/socks/host", self.line_proxy_host.text())
         settings.setValue("proxies/socks/port", self.spin_proxy_port.value())

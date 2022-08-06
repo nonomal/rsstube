@@ -4,7 +4,7 @@ from .designs.widget_filter import Ui_Dialog as Ui_Dialog_Filter
 from .designs.widget_filters import Ui_Form as Ui_Form_Filters
 from .designs.widget_filter_rule import Ui_Form as Ui_Form_FilterRule
 from rss_tube.database.feeds import Feeds
-from rss_tube.database.filters import Filter, FilterAction, Filters
+from rss_tube.database.filters import Filter, FilterAction, Filters, supported_parameters
 from rss_tube.database.settings import Settings
 from rss_tube.utils import center_widget
 
@@ -20,13 +20,13 @@ class FilterRuleWidget(QtWidgets.QWidget, QtWidgets.QTableWidgetItem, Ui_Form_Fi
         super(FilterRuleWidget, self).__init__(*args, **kwargs)
         self.setupUi(self)
 
-        self.combo_target.addItems(["Title", "Description", "Author", "Category"])
+        self.combo_target.addItems(["Title", "Description", "Author"])
         self.combo_type.addItems(["contains", "equals", "doesn't contain", "doesn't equal"])
 
 
 class NewFilterDialog(QtWidgets.QDialog, Ui_Dialog_Filter):
     """
-    Add a new filter of FilterEntryWidget rule(s)
+    A dialog to create a new filter
     """
     def __init__(self, mainwindow: QtWidgets.QMainWindow):
         super(NewFilterDialog, self).__init__()
@@ -43,19 +43,19 @@ class NewFilterDialog(QtWidgets.QDialog, Ui_Dialog_Filter):
 
         self.cb_enabled.setChecked(True)
 
-        # Invert
-        self.cb_invert.setChecked(False)
-
         # Apply to
         self.combo_apply_to_group.addItems(["All", "Category", "Channel"])
         self.combo_apply_to.hide()
 
         # Action
         self.combo_action.addItems([action.value for action in FilterAction if action is not FilterAction.Nop])
-
-        action_selected = settings.value("filter_edit_dialog/action", "Delete", type=str)
-        if self.combo_action.findText(action_selected) >= 0:
-            self.combo_action.setCurrentText(action_selected)
+        self.combo_action.setCurrentText("Delete")
+        self.line_external_program.setPlaceholderText("yt-dlp %U")
+        text = "Supported parameters (case sensitive):"
+        for p in supported_parameters:
+            text += f"\n    {p[0]}: {p[1]}"
+        self.label_external_program_parameters.setText(text)
+        self.combo_action_changed_callback(self.combo_action.currentText())
 
         # Match
         match_selected = settings.value("filter_edit_dialog/match", "any", type=str)
@@ -131,6 +131,11 @@ class NewFilterDialog(QtWidgets.QDialog, Ui_Dialog_Filter):
             feeds = sorted([feed["author"] for feed in self.feeds.get_feeds()], key=str.casefold)
             self.combo_apply_to.addItems(feeds)
         self.combo_apply_to.view().setMinimumWidth(self.combo_apply_to.minimumSizeHint().width())
+    
+    def combo_action_changed_callback(self, text: str):
+        self.label_external_program_parameters.setVisible(text == FilterAction.RunExternalProgram.value)
+        self.line_external_program.setVisible(text == FilterAction.RunExternalProgram.value)
+        self.cb_external_program_window.setVisible(text == FilterAction.RunExternalProgram.value)
 
     def dialog_accept_callback(self):
         """
@@ -158,8 +163,9 @@ class NewFilterDialog(QtWidgets.QDialog, Ui_Dialog_Filter):
                 "apply_to": self.combo_apply_to.currentText() if self.combo_apply_to.isVisible() else "",
                 "match": "any" if self.cb_match_any.isChecked() else "all" if self.cb_match_all.isChecked() else "",
                 "action": FilterAction(action_text),
+                "action_external_program": self.line_external_program.text(),
+                "show_console_window": self.cb_external_program_window.isChecked(),
                 "enabled": self.cb_enabled.isChecked(),
-                "invert": self.cb_invert.isChecked()
             })
             self.accept()
         else:
@@ -180,14 +186,15 @@ class NewFilterDialog(QtWidgets.QDialog, Ui_Dialog_Filter):
                 else settings.value("filter_edit_dialog/match", type=str))
         )
 
-        self.combo_action.currentTextChanged.connect(
-            lambda _: settings.setValue("filter_edit_dialog/action", self.combo_action.currentText())
-        )
+        self.combo_action.currentTextChanged.connect(self.combo_action_changed_callback)
 
         self.buttonBox.accepted.connect(self.dialog_accept_callback)
 
 
 class EditFilterDialog(NewFilterDialog):
+    """
+    A dialog to edit an existing filter
+    """
     def __init__(self, mainwindow: QtWidgets.QMainWindow, f: Filter):
         super(EditFilterDialog, self).__init__(mainwindow)
 
@@ -199,15 +206,14 @@ class EditFilterDialog(NewFilterDialog):
         # Enabled
         self.cb_enabled.setChecked(f["enabled"])
 
-        # Invert
-        self.cb_invert.setChecked(f["invert"])
-
         # Apply to
         self.combo_apply_to_group.setCurrentText(f["apply_to_group"])
         self.combo_apply_to.setCurrentText(f["apply_to"])
 
         # Action
         self.combo_action.setCurrentText(f["action"].value)
+        self.line_external_program.setText(f["action_external_program"])
+        self.cb_external_program_window.setChecked(f["show_console_window"])
 
         # Match
         if f["match"] == "any":
@@ -225,6 +231,9 @@ class EditFilterDialog(NewFilterDialog):
 
 
 class FilterTableWidgetItem(QtWidgets.QTableWidgetItem):
+    """
+    A filter item to add to the table in FiltersWidget
+    """
     def __init__(self, f: Filter, *args, **kwargs):
         super(FilterTableWidgetItem, self).__init__(f["name"], *args, **kwargs)
         self.filter_id = f["id"]
@@ -233,13 +242,15 @@ class FilterTableWidgetItem(QtWidgets.QTableWidgetItem):
         self.set_enabled_status(f["enabled"])
 
     def set_enabled_status(self, enabled: bool):
-        if enabled:
-            self.setForeground(QtGui.QBrush())
-        else:
-            self.setForeground(QtGui.QBrush(QtGui.QColor(115, 115, 115)))
+        brush = QtGui.QBrush() if enabled else QtGui.QBrush(QtGui.QColor(115, 115, 115))
+        self.setForeground(brush)
 
 
 class FiltersWidget(QtWidgets.QDialog, Ui_Form_Filters):
+    """
+    Widget that lists the existing filters in a table,
+    allows creating new, editing and deleting filters.
+    """
     def __init__(self, mainwindow: QtWidgets.QMainWindow):
         super(FiltersWidget, self).__init__()
         self.setupUi(self)
@@ -288,12 +299,13 @@ class FiltersWidget(QtWidgets.QDialog, Ui_Form_Filters):
             f = Filter(
                 name=filter_dialog.filter_properties["name"],
                 enabled=filter_dialog.filter_properties["enabled"],
-                invert=filter_dialog.filter_properties["invert"],
                 apply_to_group=filter_dialog.filter_properties["apply_to_group"],
                 apply_to=filter_dialog.filter_properties["apply_to"],
                 match=filter_dialog.filter_properties["match"],
                 action=filter_dialog.filter_properties["action"],
-                rules=filter_dialog.filter_properties["rules"]
+                rules=filter_dialog.filter_properties["rules"],
+                action_external_program=filter_dialog.filter_properties["action_external_program"],
+                show_console_window=filter_dialog.filter_properties["show_console_window"],
             )
             self.filters.store_filter(f)
 
@@ -311,12 +323,13 @@ class FiltersWidget(QtWidgets.QDialog, Ui_Form_Filters):
             f = Filter(
                 name=filter_dialog.filter_properties["name"],
                 enabled=filter_dialog.filter_properties["enabled"],
-                invert=filter_dialog.filter_properties["invert"],
                 apply_to_group=filter_dialog.filter_properties["apply_to_group"],
                 apply_to=filter_dialog.filter_properties["apply_to"],
                 match=filter_dialog.filter_properties["match"],
                 action=filter_dialog.filter_properties["action"],
                 rules=filter_dialog.filter_properties["rules"],
+                action_external_program=filter_dialog.filter_properties["action_external_program"],
+                show_console_window=filter_dialog.filter_properties["show_console_window"],
                 filter_id=fw.filter_id
             )
             self.filters.update_filter(f)
@@ -344,80 +357,6 @@ class FiltersWidget(QtWidgets.QDialog, Ui_Form_Filters):
             # Delete from the table
             self.tableWidget.removeRow(selected_row)
 
-    def move_top_callback(self):
-        selected_row = self.tableWidget.currentRow()
-        if selected_row <= 0:
-            return
-
-        tw: FilterTableWidgetItem = self.tableWidget.item(selected_row, 0)
-        filter_id = tw.filter_id
-
-        self.tableWidget.removeRow(selected_row)
-        self.tableWidget.insertRow(0)
-
-        f = self.filters.get_filter(filter_id)
-        self.tableWidget.setItem(0, 0, FilterTableWidgetItem(f))
-
-        self.tableWidget.selectRow(0)
-
-        self.filters.rank_top(f)
-
-    def move_up_callback(self):
-        selected_row = self.tableWidget.currentRow()
-        if selected_row <= 0:
-            return
-
-        tw: FilterTableWidgetItem = self.tableWidget.item(selected_row, 0)
-        filter_id = tw.filter_id
-
-        self.tableWidget.removeRow(selected_row)
-        self.tableWidget.insertRow(selected_row-1)
-
-        f = self.filters.get_filter(filter_id)
-        self.tableWidget.setItem(selected_row-1, 0, FilterTableWidgetItem(f))
-
-        self.tableWidget.selectRow(selected_row-1)
-
-        self.filters.rank_up(f)
-
-    def move_down_callback(self):
-        selected_row = self.tableWidget.currentRow()
-        row_count = self.tableWidget.rowCount()
-        if selected_row < 0 or selected_row == (row_count - 1):
-            return
-
-        tw: FilterTableWidgetItem = self.tableWidget.item(selected_row, 0)
-        filter_id = tw.filter_id
-
-        self.tableWidget.removeRow(selected_row)
-        self.tableWidget.insertRow(selected_row+1)
-
-        f = self.filters.get_filter(filter_id)
-        self.tableWidget.setItem(selected_row+1, 0, FilterTableWidgetItem(f))
-
-        self.tableWidget.selectRow(selected_row+1)
-
-        self.filters.rank_down(f)
-
-    def move_bottom_callback(self):
-        selected_row = self.tableWidget.currentRow()
-        row_count = self.tableWidget.rowCount()
-        if selected_row < 0 or selected_row == (row_count-1):
-            return
-
-        tw: FilterTableWidgetItem = self.tableWidget.item(selected_row, 0)
-        filter_id = tw.filter_id
-
-        self.tableWidget.removeRow(selected_row)
-        self.tableWidget.insertRow(row_count-1)
-
-        f = self.filters.get_filter(filter_id)
-        self.tableWidget.setItem(row_count-1, 0, FilterTableWidgetItem(f))
-
-        self.tableWidget.selectRow(row_count-1)
-
-        self.filters.rank_bottom(f)
-
     def keyPressEvent(self, e: QtGui.QKeyEvent) -> None:
         if e.key() == QtCore.Qt.Key.Key_Delete:
             self.delete_filter_callback()
@@ -430,10 +369,6 @@ class FiltersWidget(QtWidgets.QDialog, Ui_Form_Filters):
         self.pb_new.clicked.connect(self.new_filter_callback)
         self.pb_edit.clicked.connect(self.edit_filter_callback)
         self.pb_delete.clicked.connect(self.delete_filter_callback)
-        self.pb_top.clicked.connect(self.move_top_callback)
-        self.pb_up.clicked.connect(self.move_up_callback)
-        self.pb_down.clicked.connect(self.move_down_callback)
-        self.pb_bottom.clicked.connect(self.move_bottom_callback)
 
         self.tableWidget.itemDoubleClicked.connect(self.edit_filter_callback)
         self.tableWidget.keyPressEvent = self.keyPressEvent

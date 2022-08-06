@@ -2,6 +2,8 @@ import os
 
 from pathlib import Path
 
+from .__version__ import __title__
+
 
 DEFAULT_SETTINGS = {
     "theme": "light",
@@ -14,8 +16,10 @@ DEFAULT_SETTINGS = {
     "MainWindow/icon/height": 32,
     "MainWindow/menu/show": True,
     "MainWindow/start_minimized": False,
-    "MainWindow/export_location": os.path.join(Path.home(), "rsstube-channels.json"),
-    "MainWindow/entries_to_fetch": 1000,
+    "Channels/export_path": os.path.join(Path.home(), f"{__title__.replace(' ', '-').lower()}-channels.json"),
+    "Filters/export_path": os.path.join(Path.home(), f"{__title__.replace(' ', '-').lower()}-filters.bytes"),
+    "Settings/export_path": os.path.join(Path.home(), f"{__title__.replace(' ', '-').lower()}-settings.bytes"),
+    "MainWindow/entries_to_fetch": 100,
     "MainWindow/category_icon/show": True,
     "MainWindow/feed_icon/show": True,
     "tray/show": True,
@@ -30,10 +34,9 @@ DEFAULT_SETTINGS = {
     "player/vlc/path": "vlc",
     "player/vlc/args": "",
     "cache/preload_thumbnails": False,
-    "delete/added_more_than": False,
-    "delete/added_more_than_days": 14,
-    "delete/interval/hours": 2,
-    "delete/keep_unviewed": True,
+    "purge/enabled": False,
+    "purge/keep_unviewed": True,
+    "purge/entries_to_keep": 15,
     "shortcuts/filter": "Ctrl+F",
     "shortcuts/quit": "Ctrl+Q",
     "shortcuts/refresh": "F5",

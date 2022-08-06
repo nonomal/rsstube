@@ -1,16 +1,20 @@
 import datetime
 import logging
+import subprocess
+import sqlite3
 import time
+import os
 
-from typing import Any, List, Optional
+from typing import Any, Iterator, List, Optional, Tuple
 
 from PyQt6 import QtCore
 
 from rss_tube.database.settings import Settings
+from rss_tube.database.cache import Cache
 from rss_tube.download import Downloader
 from rss_tube.parser import parse_url, parse_feed
 from .database import Database
-from .filters import Filter, FilterAction, Filters
+from .filters import Filter, FilterAction, Filters, supported_parameters
 
 
 logger = logging.getLogger("logger")
@@ -21,6 +25,7 @@ class Feeds(object):
     def __init__(self):
         self.database = Database("feeds", QtCore.QStandardPaths.StandardLocation.AppLocalDataLocation)
         self.downloader = Downloader()
+        self.cache = Cache()
         self.filters = Filters()
         self.cursor = self.database.cursor()
 
@@ -34,17 +39,23 @@ class Feeds(object):
         """)
         
         # Feeds table
+        try:
+            self.cursor.execute("ALTER TABLE feeds ADD COLUMN purge_excluded INTEGER default 0")
+        except sqlite3.OperationalError:
+            logger.debug(f"Column purge_excluded already exists")
+
         self.cursor.execute("""
         CREATE TABLE IF NOT EXISTS feeds (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            notify       INTEGER,
-            author       TEXT,
-            category     TEXT,
-            type         TEXT,
-            url          TEXT,
-            channel_url  TEXT,
-            added_on     TEXT,
-            refreshed_on TEXT)
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            notify         INTEGER,
+            purge_excluded INTEGER,
+            author         TEXT,
+            category       TEXT,
+            type           TEXT,
+            url            TEXT,
+            channel_url    TEXT,
+            added_on       TEXT,
+            refreshed_on   TEXT)
         """)
 
         # Feed Entries table
@@ -70,6 +81,14 @@ class Feeds(object):
             duration       TEXT,
             link_raw       TEXT,
             star           INTEGER)
+        """)
+
+        # Purged entries table
+        self.cursor.execute("""
+        CREATE TABLE IF NOT EXISTS purged (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            link         TEXT
+        )
         """)
 
         self.database.commit()
@@ -111,6 +130,62 @@ class Feeds(object):
             (category,)
         )
         self.database.commit()
+    
+    def purge_feed(self, feed_id: int, num_entries_to_keep: int, keep_unviewed: bool = True) -> int:
+        # Delete all the saved thumbnails
+        params = {
+            "feed_id": feed_id,
+            "num_entries_to_keep": num_entries_to_keep
+        }
+
+        links = []
+        for q in self.cursor.execute(
+            f"""
+            SELECT * FROM (SELECT thumbnail, link FROM entries
+                WHERE feed_id=:feed_id AND star=0 AND deleted=0 {'AND viewed=1' if keep_unviewed else ''}
+                ORDER BY published DESC
+                LIMIT -1 OFFSET :num_entries_to_keep)
+            UNION ALL
+            SELECT thumbnail, link FROM entries
+                WHERE feed_id=:feed_id AND deleted=1
+            """,
+            params
+        ).fetchall():
+            self.cache.delete(q["thumbnail"])
+            links.append((q["link"],))
+
+        # Delete the entry from the entries table
+        self.cursor.execute(
+            f"""
+            DELETE FROM entries
+            WHERE id in (
+                SELECT id FROM (SELECT id FROM entries
+                    WHERE feed_id=:feed_id AND star=0 {'AND viewed=1' if keep_unviewed else ''}
+                    ORDER BY published DESC
+                    LIMIT -1 OFFSET :num_entries_to_keep)
+                UNION ALL
+                SELECT id FROM entries
+                    WHERE feed_id=:feed_id AND deleted=1 
+            )
+            """,
+            params
+        )
+
+        # Add the entry link to the purged table to prevent it from being re-added
+        self.cursor.executemany("INSERT INTO purged (link) VALUES (?)", links)
+        
+        self.database.isolation_level = None
+        self.cursor.execute("VACUUM")
+        self.database.isolation_level = ''
+        self.database.commit()
+
+        return len(links)
+
+    def purge_feeds(self, num_entries_to_keep: int, keep_unviewed: bool = True) -> int:
+        entries_purged = 0
+        for feed in self.get_feeds():
+            entries_purged += self.purge_feed(feed["id"], num_entries_to_keep, keep_unviewed=keep_unviewed)
+        return entries_purged
 
     def add_feed(self, url: str, category: str, feed_name: str = "") -> Optional[int]:
         url = parse_url(url)
@@ -250,6 +325,9 @@ class Feeds(object):
 
     def get_feeds(self) -> List:
         return self.cursor.execute("SELECT * FROM feeds ORDER BY author ASC").fetchall()
+    
+    def get_purgeable_feeds(self) -> List:
+        return self.cursor.execute("SELECT * FROM feeds WHERE purge_excluded=0").fetchall()
 
     def get_feed(self, feed_id: int) -> Any:
         return self.cursor.execute("SELECT * FROM feeds WHERE id = ?", (feed_id,)).fetchone()
@@ -403,12 +481,7 @@ class Feeds(object):
         self.cursor.execute("UPDATE feeds SET category=? WHERE category=?", (new_name, current_name))
         self.database.commit()
 
-
-    def apply_filters(self, feed: dict, entry: dict) -> FilterAction:
-        """
-        If no filter matches, FilterAction.Nop is returned
-        Returns on first filter match
-        """
+    def apply_filters(self, feed: dict, entry: dict) -> Iterator[Tuple[FilterAction, dict]]:
         for f in self.filters.get_enabled_filters():
             # check if this filter should be applied to the feed
             if f["apply_to_group"].lower() == "all":
@@ -434,12 +507,12 @@ class Feeds(object):
                     match = match and apply_rule(feed, entry, rule)
             else:
                 continue
-
-            if (not match if f["invert"] else match):
-                return FilterAction(f["action"])
-
-        # No filters matched
-        return FilterAction.Nop
+            
+            if match:
+                yield FilterAction(f["action"]), {
+                    "action_external_program": f["action_external_program"],
+                    "show_console_window": f["show_console_window"]
+                }
 
     def update_feed_entries(self, feed_id: int, commit: bool = True):
         """
@@ -461,24 +534,45 @@ class Feeds(object):
         preload_thumbnails = settings.value("cache/preload_thumbnails", type=bool)
 
         for i, entry in parsed_feed["entries"].items():
+            if self.cursor.execute("SELECT * FROM purged WHERE link=:link", entry).fetchall():
+                logger.debug(f"Entry {entry['link']} has been purged, skippping.")
+                continue
+
             entry_fetched = self.cursor.execute("SELECT * FROM entries WHERE entry_id=:entry_id", entry).fetchone()
             if not entry_fetched:
                 # Filter the new entry
-                action: FilterAction = self.apply_filters(parsed_feed, entry)
                 entry.update({
                     "feed_id": feed_id,
                     "deleted": 0,
                     "viewed": 0,
                     "star": 0,
                 })
-                if action == FilterAction.Delete:
-                    entry.update({"deleted": 1})
-                elif action == FilterAction.MarkViewed:
-                    entry.update({"viewed": 1})
-                elif action == FilterAction.Star:
-                    entry.update({"star": 1})
-                elif action == FilterAction.StarAndMarkViewed:
-                    entry.update({"viewed": 1, "star": 1})
+                for action, action_args in self.apply_filters(parsed_feed, entry):
+                    if action == FilterAction.Delete:
+                        entry.update({"deleted": 1})
+                    elif action == FilterAction.MarkViewed:
+                        entry.update({"viewed": 1})
+                    elif action == FilterAction.Star:
+                        entry.update({"star": 1})
+                    elif action == FilterAction.StarAndMarkViewed:
+                        entry.update({"viewed": 1, "star": 1})
+                    elif action == FilterAction.RunExternalProgram:
+                        command = action_args["action_external_program"]
+                        show_console = action_args["show_console_window"]
+                        for p in supported_parameters:
+                            command = command.replace(p[0], entry[p[2]])
+                        logger.debug(f"Executing command '{command}' on entry")
+                        try:
+                            if os.name == "nt":
+                                si = subprocess.STARTUPINFO()
+                                if not show_console:
+                                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                                subprocess.Popen(command, startupinfo=si)
+                            else:
+                                # TODO: show console on linux
+                                subprocess.Popen(command, shell=True)
+                        except Exception as e:
+                            logger.error(f"Error executing [{command}]: {e}")
 
                 self.cursor.execute(
                     """
@@ -555,6 +649,13 @@ class Feeds(object):
 
     def mark_star(self, entry_id: int, star: bool):
         self.cursor.execute("UPDATE entries SET star=? WHERE id=?", (star, entry_id))
+        self.database.commit()
+
+    def get_excluded_channels(self) -> List:
+        return self.cursor.execute("SELECT * FROM feeds WHERE purge_excluded=1").fetchall()
+
+    def set_purge_excluded(self, id: int, excluded: bool):
+        self.cursor.execute("UPDATE feeds SET purge_excluded=? WHERE id=?", (excluded, id))
         self.database.commit()
 
     def __len__(self):

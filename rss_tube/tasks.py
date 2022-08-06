@@ -25,7 +25,6 @@ class Tasks(QtCore.QThread):
         self.running = False
 
         self.feed_update_task = FeedsUpdateTask()
-        self.delete_entries_task = DeleteEntriesTask()
 
         self.interval = settings.value("tasks/interval", type=int)
 
@@ -36,11 +35,16 @@ class Tasks(QtCore.QThread):
             self.feed_update_job.last_run = datetime.now()
         self.job_update_info.emit(self.feed_update_job.last_run, self.feed_update_job.next_run)
 
+        # Start purge task
+        if settings.value("purge/enabled", type=bool):
+            self.purge_task = PurgeFeedsTask()
+            self.purge_task.start()
+            self.purge_task.started.connect(lambda: logger.debug("Auto PurgeFeedsTask started."))
+            self.purge_task.finished.connect(lambda: logger.debug("Auto PurgeFeedsTask finished."))
+
     def set_schedule(self):
         schedule.clear("update-feed")
-        schedule.clear("delete_entries")
         self.feed_update_job = schedule.every(settings.value("feeds/update_interval/minutes", type=int)).minutes.do(self.feed_update_task.start).tag("update-feed")
-        schedule.every(settings.value("delete/interval/hours", type=int)).hours.do(self.delete_entries_task.start).tag("delete_entries")
 
         self.job_update_info.emit(self.feed_update_job.last_run or datetime.now(), self.feed_update_job.next_run or datetime.now())
         self.feed_update_task._finished.connect(self._feed_update_task_finished_callback)
@@ -80,14 +84,61 @@ class BaseTask(QtCore.QThread):
             self.running = False
 
 
-class DeleteEntriesTask(BaseTask):
+class PurgeFeedsTask(BaseTask):
+    maximum = pyqtSignal(int)
+    current = pyqtSignal(str)
+    report = pyqtSignal(dict) # {"progress": <int>, "entries": <int>, "feeds": <int>}
+
+    def __init__(self):
+        super(PurgeFeedsTask, self).__init__()
+        self.request_stop = False
+
     def task(self):
-        if settings.value("delete/added_more_than", type=bool):
-            feeds = Feeds()
-            feeds.delete_entries_added_more_than_days(
-                settings.value("delete/added_more_than_days", type=int),
-                settings.value("delete/keep_unviewed", type=bool)
+        self.request_stop =  False
+
+        feeds = Feeds()
+        feeds_list = feeds.get_purgeable_feeds()
+
+        self.maximum.emit(len(feeds_list))
+
+        report = {
+            "progress": 0,
+            "entries": 0,
+            "feeds": 0
+        }
+
+        for i, feed in enumerate(feeds_list):
+            if self.request_stop:
+                break
+
+            self.current.emit(feed["author"])
+
+            num_purged = feeds.purge_feed(
+                feed["id"],
+                settings.value("purge/entries_to_keep", type=int),
+                settings.value("purge/keep_unviewed",  type=bool)
             )
+
+            report["entries"] += num_purged
+            report["feeds"] += num_purged > 0
+            report["progress"] = i+1
+            self.report.emit(report)
+
+        logger.debug(f"Purged {report['entries']} entries in {report['feeds']} feeds.")
+
+
+class PurgeFeedTask(BaseTask):
+    def __init__(self, feed_id: int):
+        super(PurgeFeedTask, self).__init__()
+        self.feed_id = feed_id
+
+    def task(self):
+        feeds = Feeds()
+        feeds.purge_feed(
+            self.feed_id,
+            settings.value("purge/entries_to_keep", type=int),
+            settings.value("purge/keep_unviewed",  type=bool)
+        )
 
 
 class FeedsUpdateTask(BaseTask):
@@ -174,6 +225,37 @@ class ExportFeedsTask(BaseTask):
             json.dump(j, f, indent=4)
 
 
+class ImportFiltersTask(BaseTask):
+    imported = pyqtSignal(int)
+
+    def __init__(self, fname: str):
+        super(ImportFiltersTask, self).__init__()
+        self.fname = fname
+
+    def task(self):
+        try:
+            with open(self.fname, "r") as f:
+                j = json.load(f)
+        except FileNotFoundError:
+            logger.error(f"ImportFiltersTask failed: {self.name} does not exist.")
+            self.failed.emit()
+            return
+
+        ...
+
+
+class ExportFiltersTask(BaseTask):
+    def __init__(self, fname: str):
+        super(ExportFiltersTask, self).__init__()
+        self.fname = fname
+
+    def task(self):
+        ...
+
+        # with open(self.fname, "w") as f:
+        #     json.dump(j, f, indent=4)
+
+
 class SaveThumbnailTask(BaseTask):
     def __init__(self, img_url: str, fname: str):
         super(SaveThumbnailTask, self).__init__()
@@ -185,3 +267,27 @@ class SaveThumbnailTask(BaseTask):
         if content := downloader.get_bytes(self.img_url):
             with open(self.fname, "wb") as f:
                 f.write(content)
+
+
+class ExportSettingsTask(BaseTask):
+    success = pyqtSignal()
+
+    def __init__(self, path: str):
+        super(ExportSettingsTask, self).__init__()
+        self.path = path
+
+    def task(self):
+        settings.export(self.path)
+        self.success.emit()
+
+
+class ImportSettingsTask(BaseTask):
+    success = pyqtSignal()
+
+    def __init__(self, path: str):
+        super(ImportSettingsTask, self).__init__()
+        self.path = path
+
+    def task(self):
+        settings.load(self.path)
+        self.success.emit()

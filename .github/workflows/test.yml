@@ -2,7 +2,9 @@ name: build
 
 on:
   push:
-    tags:
+    branches-ignore:
+      - master
+    tags-ignore:
       - '*'
 
 jobs:
@@ -38,7 +40,7 @@ jobs:
   build-ubuntu:
     strategy:
       matrix:
-        tag: [focal, hirsute, impish, jammy]
+        tag: [focal]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
@@ -79,7 +81,7 @@ jobs:
         name: rsstube.dmg
         path: rsstube.dmg
 
-  pypi:
+  build-pip:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
@@ -95,33 +97,8 @@ jobs:
         pip install build
     - name: create pip package
       run: python -m build
-    - name: upload to pypi
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        password: ${{ secrets.PYPI_API_TOKEN }}
     - name: Upload artifact
       uses: actions/upload-artifact@v2
       with:
-        name: rsstube-${{ github.ref_name }}-py3-none-any.whl
-        path: dist/rsstube-${{ github.ref_name }}-py3-none-any.whl
-
-  release:
-    runs-on: ubuntu-latest
-    needs: [build-win64, build-ubuntu, build-macos, pypi]
-    steps:
-    - uses: actions/checkout@v2
-    - uses: actions/download-artifact@master
-    - name: Release
-      uses: marvinpinto/action-automatic-releases@latest
-      with:
-        repo_token: "${{ secrets.GITHUB_TOKEN }}"
-        prerelease: false
-        files: |
-          rsstube-installer-win.exe
-          rsstube-portable-win.zip
-          rsstube.dmg
-          rsstube_amd64_ubuntu_focal.deb
-          rsstube_amd64_ubuntu_hirsute.deb
-          rsstube_amd64_ubuntu_impish.deb
-          rsstube_amd64_ubuntu_jammy.deb
-          rsstube-${{ github.ref_name }}-py3-none-any.whl
+        name: rsstube.whl
+        path: dist/rsstube-*.whl
